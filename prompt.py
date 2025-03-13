@@ -6,12 +6,13 @@ import mimetypes
 from pathlib import Path
 import subprocess
 import logging
+from fnmatch import fnmatch
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Files and directories to ignore
+# Files and directories to ignore (original set)
 IGNORE_PATTERNS = {
     '.DS_Store', '.Spotlight-V100', '.Trashes', '.fseventsd', '.AppleDouble',
     'node_modules', 'vendor', '.git', '.svn', '.hg', 'dist',
@@ -19,17 +20,53 @@ IGNORE_PATTERNS = {
     '.o', '.obj', '.so', '.dylib', '.dll', '.exe', '.env'
 }
 
-def should_ignore(path):
-    """Check if a path should be ignored"""
-    path = str(path)
-    return any(pattern in path.split(os.sep) for pattern in IGNORE_PATTERNS)
+class GitIgnore:
+    """Handle .gitignore pattern matching"""
+    def __init__(self):
+        self.patterns = []
 
-def get_file_contents(file_path):
+    def load(self, gitignore_path):
+        """Load patterns from a .gitignore file"""
+        try:
+            with open(gitignore_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        self.patterns.append(line)
+            logger.debug(f"Loaded .gitignore patterns from {gitignore_path}: {self.patterns}")
+        except Exception as e:
+            logger.debug(f"No .gitignore found or error reading {gitignore_path}: {str(e)}")
+
+    def matches(self, path, root):
+        """Check if a path matches any gitignore pattern"""
+        rel_path = str(Path(path).relative_to(root))
+        for pattern in self.patterns:
+            if pattern.startswith('/'):
+                pattern = pattern[1:]
+            if fnmatch(rel_path, pattern) or fnmatch(os.path.basename(path), pattern):
+                return True
+        return False
+
+def should_ignore(path, gitignore_cache=None):
+    """Check if a path should be ignored based on static patterns and .gitignore"""
+    path = str(path)
+    
+    # Check static ignore patterns
+    if any(pattern in path.split(os.sep) for pattern in IGNORE_PATTERNS):
+        return True
+    
+    # Check .gitignore patterns if cache is provided
+    if gitignore_cache and path in gitignore_cache:
+        return gitignore_cache[path]
+        
+    return False
+
+def get_file_contents(file_path, gitignore_cache=None):
     """Read contents of text-based files, return appropriate content"""
     file_path = Path(file_path)
     logger.debug(f"Processing file: {file_path}")
     
-    if should_ignore(file_path):
+    if should_ignore(file_path, gitignore_cache):
         logger.debug(f"Ignoring file: {file_path}")
         return None
     
@@ -59,6 +96,7 @@ def get_file_contents(file_path):
 def build_file_map(paths):
     """Build the file structure map for multiple paths"""
     map_lines = ["<file_map>\n"]
+    gitignore_cache = {}
     
     for path in paths:
         path = Path(path)
@@ -66,21 +104,38 @@ def build_file_map(paths):
         map_lines.append(f"{path}\n")
         
         if path.is_dir():
+            # Load .gitignore if present
+            gitignore = GitIgnore()
+            gitignore_path = path / '.gitignore'
+            if gitignore_path.exists():
+                gitignore.load(gitignore_path)
+            
             for root, dirs, files in os.walk(path, topdown=True):
-                if should_ignore(root):
+                root_path = Path(root)
+                if should_ignore(root, gitignore_cache):
                     dirs[:] = []
                     continue
-                    
-                rel_root = Path(root).relative_to(path)
+                
+                # Cache gitignore matches for this directory
+                for item in dirs + files:
+                    full_path = root_path / item
+                    if gitignore.patterns and gitignore.matches(full_path, path):
+                        gitignore_cache[str(full_path)] = True
+                    else:
+                        gitignore_cache[str(full_path)] = should_ignore(full_path)
+                
+                rel_root = root_path.relative_to(path)
                 level = len(rel_root.parts)
                 
                 for dir_name in sorted(dirs):
-                    if not should_ignore(os.path.join(root, dir_name)):
+                    dir_path = os.path.join(root, dir_name)
+                    if not gitignore_cache.get(dir_path, False):
                         indent = "    " * level
                         map_lines.append(f"{indent}├── {dir_name}\n")
                 
                 for file_name in sorted(files):
-                    if not should_ignore(os.path.join(root, file_name)):
+                    file_path = os.path.join(root, file_name)
+                    if not gitignore_cache.get(file_path, False):
                         indent = "    " * level
                         map_lines.append(f"{indent}├── {file_name}\n")
         else:
@@ -92,42 +147,49 @@ def build_file_map(paths):
 def build_file_contents(paths):
     """Build the file contents section for multiple paths"""
     content_lines = ["<file_contents>\n"]
+    gitignore_cache = {}
     
     for path in paths:
         path = Path(path)
         logger.debug(f"Processing path for contents: {path}")
         
         if path.is_dir():
-            # Walk through all files in the directory recursively
+            # Load .gitignore if present
+            gitignore = GitIgnore()
+            gitignore_path = path / '.gitignore'
+            if gitignore_path.exists():
+                gitignore.load(gitignore_path)
+            
             for root, _, files in os.walk(path):
-                if should_ignore(root):
+                root_path = Path(root)
+                if should_ignore(root, gitignore_cache):
                     logger.debug(f"Skipping ignored directory: {root}")
                     continue
-                    
-                root_path = Path(root)
+                
+                # Cache gitignore matches for this directory
+                for file_name in files:
+                    full_path = root_path / file_name
+                    if gitignore.patterns and gitignore.matches(full_path, path):
+                        gitignore_cache[str(full_path)] = True
+                    else:
+                        gitignore_cache[str(full_path)] = should_ignore(full_path)
+                
                 for file_name in sorted(files):
                     file_path = root_path / file_name
-                    if should_ignore(file_path):
-                        logger.debug(f"Skipping ignored file: {file_path}")
-                        continue
-                        
-                    # Calculate relative path from the original input path
-                    rel_path = file_path.relative_to(path)
-                    content = get_file_contents(file_path)
-                    if content is not None:
-                        content_lines.append(f"File: {rel_path}\n")
-                        content_lines.append(f"```\n{content}\n```\n\n")
-                    else:
-                        logger.debug(f"No content returned for {file_path}")
+                    if not gitignore_cache.get(str(file_path), False):
+                        rel_path = file_path.relative_to(path)
+                        content = get_file_contents(file_path, gitignore_cache)
+                        if content is not None:
+                            content_lines.append(f"File: {rel_path}\n")
+                            content_lines.append(f"```\n{content}\n```\n\n")
+                        else:
+                            logger.debug(f"No content returned for {file_path}")
         else:
-            # Handle single file
-            content = get_file_contents(path)
+            content = get_file_contents(path, gitignore_cache)
             if content is not None:
-                rel_path = path.name  # Just the filename for single files
+                rel_path = path.name
                 content_lines.append(f"File: {rel_path}\n")
                 content_lines.append(f"```\n{content}\n```\n\n")
-            else:
-                logger.debug(f"No content returned for single file {path}")
     
     content_lines.append("</file_contents>")
     return "".join(content_lines)
